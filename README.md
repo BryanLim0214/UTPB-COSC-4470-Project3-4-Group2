@@ -1,8 +1,11 @@
 # COSC 4470 - Projects 3 & 4: System Hardening
 
 **Course:** COSC 4470 - Applied Network Security
+
 **Institution:** The University of Texas Permian Basin (UTPB) Odessa
+
 **Group:** Group 2
+
 **Date:** April 29, 2025
 
 **Group Members:**
