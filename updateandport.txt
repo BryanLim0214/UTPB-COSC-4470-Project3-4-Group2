@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# This script combines apt update and basic firewall rules (default drop)
+# based on the provided files.
+
+# --- Log Function (Optional but good practice) ---
+LOG_DIR="/var/log/security_hardening"
+LOG_FILE="$LOG_DIR/update_firewall_$(date +%Y%m%d-%H%M%S).log"
+
+mkdir -p $LOG_DIR
+touch $LOG_FILE
+
+log() {
+  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$timestamp] $1" | tee -a $LOG_FILE
+}
+
+# --- Check for Root ---
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: This script must be run as root (or using sudo)." >&2
+  exit 1
+fi
+
+log "[+] Starting script..."
+
+# --- Part 1: Update Sources and Run apt-get update ---
+# (Adapted from combined_hardening_script.txt)
+log "[*] Step 1: Updating package sources and running apt-get update..."
+
+SOURCES_FILE="/etc/apt/sources.list"
+BACKUP_FILE="/etc/apt/sources.list.bak.$(date +%F-%T)"
+OLD_RELEASES_URL="http://old-releases.ubuntu.com/ubuntu/"
+
+log "[-] Backing up current $SOURCES_FILE to $BACKUP_FILE..."
+if [ -f "$SOURCES_FILE" ]; then
+  cp -p "$SOURCES_FILE" "$BACKUP_FILE" # [cite: 25]
+  if [ $? -ne 0 ]; then
+    log "ERROR: Failed to create backup file. Aborting."
+    exit 1
+  fi
+  log "[+] Backup created successfully."
+else
+  log "Warning: $SOURCES_FILE not found, skipping backup." # [cite: 25]
+fi
+
+log "[-] Creating new $SOURCES_FILE pointing to old-releases..." # [cite: 26]
+cat > "$SOURCES_FILE" << EOF # [cite: 27]
+#------------------------------------------------------------------------------#
+#       OFFICIAL UBUNTU REPOS (Hardy 8.04) - Pointed to old-releases          #
+#------------------------------------------------------------------------------#
+deb ${OLD_RELEASES_URL} hardy main restricted universe multiverse
+deb ${OLD_RELEASES_URL} hardy-updates main restricted universe multiverse
+deb ${OLD_RELEASES_URL} hardy-security main restricted universe multiverse
+EOF
+
+log "[+] New sources.list created successfully."
+
+log "[-] Running apt-get update... (This may take a while)"
+export DEBIAN_FRONTEND=noninteractive # [cite: 28]
+apt-get update -y -q >> $LOG_FILE 2>&1 # [cite: 28]
+if [ $? -ne 0 ]; then
+  log "WARNING: apt-get update finished with errors. Check $LOG_FILE." # [cite: 28]
+else
+  log "[+] apt-get update completed successfully." # [cite: 28]
+fi
+
+# --- Part 2: Apply Firewall Rules (Default Drop) ---
+# (Adapted from portclosed.txt)
+log "[*] Step 2: Applying firewall rules (Default DROP)..."
+
+# Flush existing rules first
+log "[-] Flushing existing firewall rules..." # [cite: 2]
+iptables -F # [cite: 2]
+iptables -X # [cite: 2]
+iptables -t nat -F # [cite: 2]
+iptables -t nat -X # [cite: 2]
+iptables -t mangle -F # [cite: 2]
+iptables -t mangle -X # [cite: 2]
+
+# Set default policies: DROP incoming/forwarding, Allow outgoing
+log "[-] Setting default policies to DROP (Input/Forward)..." # [cite: 2]
+iptables -P INPUT DROP # [cite: 2]
+iptables -P FORWARD DROP # [cite: 2]
+iptables -P OUTPUT ACCEPT # [cite: 2]
+
+# Allow loopback traffic (essential)
+log "[-] Allowing loopback traffic..." # [cite: 2]
+iptables -A INPUT -i lo -j ACCEPT # [cite: 2]
+iptables -A OUTPUT -o lo -j ACCEPT # [cite: 2]
+
+# Allow established and related connections (allows return traffic)
+log "[-] Allowing established/related connections..." # [cite: 2]
+iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT # [cite: 2]
+
+# Define ports to keep open (Customize this list as needed)
+# Using the list from portclosed.txt as an example
+ALLOWED_TCP_PORTS=( # [cite: 4]
+    21   # FTP
+    22   # SSH
+    23   # Telnet
+    80   # HTTP
+    139  # NetBIOS
+    445  # Microsoft-DS
+    1524 # Ingreslock/Bindshell port
+    3306 # MySQL
+    5432 # PostgreSQL
+    5900 # VNC
+    8009 # AJP13
+    8180 # Tomcat HTTP
+)
+
+log "[-] Allowing specified necessary TCP ports..." # [cite: 5]
+for port in "${ALLOWED_TCP_PORTS[@]}"; do # [cite: 5]
+    log "    - Allowing TCP port $port"
+    iptables -A INPUT -p tcp --dport "$port" -m state --state NEW -j ACCEPT # [cite: 5]
+done
+
+# Add rate limiting for SSH (optional but recommended)
+log "[-] Adding rate limiting for SSH port 22..." # [cite: 6]
+if ! iptables -C INPUT -p tcp --dport 22 -m state --state NEW -m recent --set --name SSH > /dev/null 2>&1; then # [cite: 6]
+    iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --set --name SSH # [cite: 7]
+    iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP # [cite: 7]
+else
+    log "    SSH rate limiting rules likely already exist." # [cite: 8]
+fi
+
+log "[+] Firewall rules applied. All incoming traffic dropped by default except listed ports." # [cite: 9]
+log "[+] Ports allowed: ${ALLOWED_TCP_PORTS[*]}" # [cite: 9]
+
+log "[+] Script finished."
+echo ""
+echo "Script finished. Check log file for details: $LOG_FILE"
+echo "Run 'sudo iptables -L -n -v' to see current rules." # [cite: 10]
+echo "Remember to make rules persistent (e.g., using iptables-persistent) if needed." # [cite: 11]
+
+exit 0

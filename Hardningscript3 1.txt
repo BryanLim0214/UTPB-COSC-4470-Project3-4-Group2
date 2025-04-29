@@ -1,0 +1,863 @@
+#!/bin/bash
+# Metasploitable 2 Enhanced Hardening Script (Project 3 Adaptation - v3)
+# Includes checks for service status, config tests, and robust vsftpd version check.
+# Preserves functionality required for Project 3 while securing critical vulnerabilities.
+# Addresses project requirements for user accounts and network context.
+# MUST BE RUN AS ROOT or using sudo!
+
+# --- Terminal Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# --- Configuration ---
+SOURCES_FILE="/etc/apt/sources.list"
+BACKUP_FILE="/etc/apt/sources.list.bak.$(date +%F-%T)"
+OLD_RELEASES_URL="http://old-releases.ubuntu.com/ubuntu/"
+LOG_DIR="/var/log/security_hardening"
+LOG_FILE="$LOG_DIR/hardening_$(date +%Y%m%d-%H%M%S).log"
+CREDENTIALS_FILE="$LOG_DIR/secure_credentials.txt"
+INETD_CONF="/etc/inetd.conf"
+VSFTPD_CONF="/etc/vsftpd.conf"
+
+# --- Project Specific Variables ---
+GROUP_USER=""
+GROUP_PASS=""
+
+# --- State Variables ---
+MYSQL_ROOT_PW_SET_SUCCESS=0 # Flag to track if MySQL root password was likely set
+
+# --- Print Banner ---
+echo -e "${GREEN}==========================================================${NC}"
+echo -e "${GREEN}   METASPLOITABLE 2 ENHANCED HARDENING SCRIPT (Project 3 v3)${NC}"
+echo -e "${GREEN}==========================================================${NC}"
+echo -e "${YELLOW}This script hardens security while preserving functionality${NC}"
+echo -e "${YELLOW}required for Project 3 testing on Metasploitable 2.      ${NC}"
+echo -e "${YELLOW}Includes checks for service status and config tests.      ${NC}"
+echo -e "${YELLOW}REMINDER: Choose lightweight OSes for the other two servers${NC}"
+echo -e "${YELLOW}(Firewall/IDS) due to hardware limits (P3/2GB RAM/33GB HDD).${NC}"
+echo -e "${GREEN}==========================================================${NC}"
+echo ""
+
+# --- Check for Root ---
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${RED}ERROR: This script must be run as root (or using sudo).${NC}" >&2
+  exit 1
+fi
+
+# --- Get Project User Credentials ---
+echo -e "${BLUE}Please provide the credentials for the project group user.${NC}"
+echo -e "${BLUE}This user will have FTP, SSH, and Telnet access to MS2.${NC}"
+while [ -z "$GROUP_USER" ]; do
+  read -p "Enter project username: " GROUP_USER
+done
+while [ -z "$GROUP_PASS" ]; do
+  read -s -p "Enter project password: " GROUP_PASS
+  echo "" # newline after password input
+  read -s -p "Confirm project password: " GROUP_PASS_CONFIRM
+  echo "" # newline
+  if [ "$GROUP_PASS" != "$GROUP_PASS_CONFIRM" ]; then
+    echo -e "${RED}Passwords do not match. Please try again.${NC}"
+    GROUP_PASS="" # Clear password to loop again
+  fi
+done
+
+# Create log directory
+mkdir -p $LOG_DIR
+touch $LOG_FILE
+touch $CREDENTIALS_FILE
+chmod 600 $CREDENTIALS_FILE
+
+# Function to log actions
+log() {
+  # Log with timestamp to file and echo to stdout
+  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  # Using current date for log timestamp from system clock
+  local current_timestamp=$(date '+%Y-%m-%d %H:%M:%S') # Use system's current time
+  echo -e "[$current_timestamp] $1" | tee -a $LOG_FILE
+}
+
+
+save_credential() {
+  # Save credentials securely
+  echo -e "$1" >> $CREDENTIALS_FILE
+}
+
+log "${GREEN}[+] Beginning security hardening for Project 3 (v3) at $(date)${NC}"
+save_credential "METASPLOITABLE 2 PROJECT 3 HARDENING CREDENTIALS\n=========================================="
+save_credential "Created on: $(date)"
+save_credential "Project Group User: $GROUP_USER"
+save_credential "Project Group Pass: $GROUP_PASS" # Note: Storing passwords in files has risks. Secure this file!
+save_credential "=========================================="
+
+# --- Part 1: Update Sources ---
+log "${YELLOW}[*] Step 1/9: Updating package sources...${NC}"
+
+# --- Backup Original File ---
+log "${BLUE}[-] Backing up current $SOURCES_FILE to $BACKUP_FILE...${NC}"
+if [ -f "$SOURCES_FILE" ]; then
+  cp -p "$SOURCES_FILE" "$BACKUP_FILE"
+  if [ $? -ne 0 ]; then
+    log "${RED}[!] ERROR: Failed to create backup file. Aborting.${NC}"
+    exit 1
+  fi
+  log "${GREEN}[+] Backup created successfully.${NC}"
+else
+  log "${YELLOW}[!] Warning: $SOURCES_FILE not found, skipping backup.${NC}"
+fi
+
+# --- Create New sources.list Content ---
+log "${BLUE}[-] Creating new $SOURCES_FILE pointing to old-releases...${NC}"
+cat > "$SOURCES_FILE" << EOF
+#------------------------------------------------------------------------------#
+#        OFFICIAL UBUNTU REPOS (Hardy 8.04) - Project 3 Hardening             #
+#    Pointed to old-releases.ubuntu.com as standard archives are offline     #
+#------------------------------------------------------------------------------#
+
+###### Ubuntu Main Repos
+deb ${OLD_RELEASES_URL} hardy main restricted universe multiverse
+# deb-src ${OLD_RELEASES_URL} hardy main restricted universe multiverse
+
+###### Ubuntu Update Repos
+deb ${OLD_RELEASES_URL} hardy-updates main restricted universe multiverse
+# deb-src ${OLD_RELEASES_URL} hardy-updates main restricted universe multiverse
+
+###### Ubuntu Security Repos
+deb ${OLD_RELEASES_URL} hardy-security main restricted universe multiverse
+# deb-src ${OLD_RELEASES_URL} hardy-security main restricted universe multiverse
+EOF
+
+log "${GREEN}[+] New sources.list created successfully.${NC}"
+
+# --- Run apt-get update ---
+log "${BLUE}[-] Running apt-get update... (This may take a while)${NC}"
+apt-get update >> $LOG_FILE 2>&1
+if [ $? -ne 0 ]; then
+  log "${YELLOW}[!] WARNING: apt-get update finished with errors. Check $LOG_FILE.${NC}"
+else
+  log "${GREEN}[+] apt-get update completed successfully.${NC}"
+fi
+
+# --- Part 2: Install Essential Local Security Tools ---
+log "${YELLOW}[*] Step 2/9: Installing minimal LOCAL security tools...${NC}"
+log "${BLUE}[-] Note: The primary firewall/IDS should be on a separate server.${NC}"
+
+# Minimal tools for local defense-in-depth on MS2
+SECURITY_TOOLS=(
+  "iptables" # For local firewall rules
+  "tcpd"     # TCP Wrappers (hosts.allow/deny)
+)
+
+# Install each tool, ignoring failures if unavailable
+for tool in "${SECURITY_TOOLS[@]}"; do
+  log "${BLUE}[-] Installing $tool on MS2...${NC}"
+  apt-get install -y $tool >> $LOG_FILE 2>&1
+  if [ $? -eq 0 ]; then
+    log "${GREEN}[+] Successfully installed $tool${NC}"
+  else
+    log "${YELLOW}[!] Failed to install $tool - may not be available or needed.${NC}"
+  fi
+done
+
+log "${GREEN}[+] Basic local security tools installation completed${NC}"
+
+# --- Part 3: Remove Known Backdoors ---
+# (v3: Includes robust vsftpd check)
+log "${YELLOW}[*] Step 3/9: Removing known backdoors (while preserving service function)...${NC}"
+
+# Check for and remove ingreslock backdoor (bindshell on port 1524)
+# Note: We keep port 1524 open as it's a 'legit' service in MS2 context, but remove the shell.
+if grep -q "ingreslock.*shell" $INETD_CONF 2>/dev/null; then
+  log "${RED}[!] Found ingreslock backdoor SHELL in $INETD_CONF${NC}"
+  cp $INETD_CONF $INETD_CONF.bak.ingreslock
+  # Comment out the line instead of deleting, easier to revert if needed
+  sed -i '/ingreslock.*shell/s/^/# DISABLED_BY_HARDENING: /' $INETD_CONF
+  # Ensure inetd is instructed to re-read config
+  pkill -HUP inetd >> $LOG_FILE 2>&1
+  log "${GREEN}[+] Disabled ingreslock backdoor shell in $INETD_CONF.${NC}"
+  log "${YELLOW}[!] Port 1524 (ingreslock service) remains open for testing.${NC}"
+else
+  log "${GREEN}[+] No ingreslock backdoor shell found in $INETD_CONF.${NC}"
+fi
+
+# Check for vsftpd backdoor (version 2.3.4) - Block port 6200
+VSFTPD_IS_VULN=0 # Flag
+if [ -f "/usr/sbin/vsftpd" ]; then
+  log "${BLUE}[-] Checking vsftpd version...${NC}"
+  # Method 1: Direct version output
+  VSFTPD_VERSION_OUTPUT=$(/usr/sbin/vsftpd -version 2>&1)
+  log "[INFO] vsftpd -version output: $VSFTPD_VERSION_OUTPUT"
+  if echo "$VSFTPD_VERSION_OUTPUT" | grep -q "2.3.4"; then
+    log "${RED}[!] Found vulnerable vsftpd version 2.3.4 via direct check.${NC}"
+    VSFTPD_IS_VULN=1
+  else
+    # Method 2: Fallback using dpkg package info if direct check inconclusive
+    log "[INFO] Direct vsftpd version check inconclusive or empty. Trying dpkg..."
+    DPKG_VSFTPD_VERSION=$(dpkg -s vsftpd 2>/dev/null | grep '^Version:')
+    log "[INFO] dpkg vsftpd version string: $DPKG_VSFTPD_VERSION"
+    if echo "$DPKG_VSFTPD_VERSION" | grep -q "2.3.4"; then
+        log "${RED}[!] Found vulnerable vsftpd version 2.3.4 via dpkg check.${NC}"
+        VSFTPD_IS_VULN=1
+    else
+        log "${GREEN}[+] vsftpd version does not appear to be the backdoored 2.3.4 based on available checks.${NC}"
+    fi
+  fi
+
+  # Actions if vulnerable version detected
+  if [ "$VSFTPD_IS_VULN" -eq 1 ]; then
+    # Kill any existing backdoor processes listening on 6200
+    if netstat -tulnp | grep -q ":6200 "; then
+      log "${RED}[!] Found vsftpd backdoor running on port 6200! Killing...${NC}"
+      pkill -f "vsftpd.*:)" >> $LOG_FILE 2>&1
+      log "${GREEN}[+] Attempted to kill vsftpd backdoor process.${NC}"
+    fi
+  fi
+  # Always add firewall block rule as defense-in-depth regardless of version detection success
+  log "${YELLOW}[!] Ensuring firewall rule BLOCKS vsftpd backdoor port 6200 locally.${NC}"
+else
+  log "${YELLOW}[!] vsftpd binary not found, skipping check.${NC}"
+fi
+
+
+# Check for UnrealIRCd backdoor
+if [ -d "/usr/local/unrealircd" ] || [ -d "/etc/unrealircd" ] || command -v unrealircd >/dev/null 2>&1; then
+  log "${YELLOW}[!] Found UnrealIRCd installation - checking for backdoor.${NC}"
+  # Check common locations for the backdoor signature
+  if grep -r --include="*.c" --include="*.h" "DEBUG3_DOLOG_SYSTEM" /usr/local/unrealircd /etc/unrealircd /usr/src/unrealircd* 2>/dev/null; then
+    log "${RED}[!] Found UnrealIRCd backdoor signature! Disabling service...${NC}"
+    pkill -f unrealircd >> $LOG_FILE 2>&1
+    # Find and remove potential startup scripts
+    find /etc/init.d -name "*unreal*" -exec update-rc.d -f {} remove \; >> $LOG_FILE 2>&1
+    rm -f /etc/rc*.d/*unreal* >> $LOG_FILE 2>&1
+    log "${GREEN}[+] Disabled UnrealIRCd service and removed potential startup links.${NC}"
+    log "${YELLOW}[!] Will add firewall rule to BLOCK UnrealIRCd ports (e.g., 6667, 6697) locally.${NC}"
+  else
+    log "${GREEN}[+] No obvious UnrealIRCd backdoor signature found. Service left running if active.${NC}"
+    log "${YELLOW}[!] Consider blocking IRC ports (6667, 6697) in the main firewall.${NC}"
+ fi
+else
+ log "${GREEN}[+] UnrealIRCd not found, skipping check.${NC}"
+fi
+
+# --- Part 4: Secure Database Services ---
+log "${YELLOW}[*] Step 4/9: Securing database services (MySQL, PostgreSQL)...${NC}"
+
+# MySQL hardening
+MYSQL_ROOT_PASSWORD="" # Initialize variable
+if command -v mysql &> /dev/null; then
+  log "${BLUE}[-] Securing MySQL...${NC}"
+
+  # Generate a strong root password
+  MYSQL_ROOT_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9') # Ensure compatible characters
+  save_credential "MySQL root password (generated): $MYSQL_ROOT_PASSWORD"
+
+  # Check if MySQL is running
+  if ! service mysql status &> /dev/null; then
+     log "${YELLOW}[!] MySQL service not running. Attempting to start...${NC}"
+     service mysql start >> $LOG_FILE 2>&1
+     sleep 3 # Give service time to start
+     if ! service mysql status &> /dev/null; then
+        log "${RED}[!] Failed to start MySQL service. Cannot secure MySQL automatically.${NC}"
+     else
+        log "${GREEN}[+] MySQL service started successfully.${NC}"
+     fi
+  else
+     log "${GREEN}[+] MySQL service is already running.${NC}"
+  fi
+
+  # Attempt to set password only if MySQL is running
+  if service mysql status &> /dev/null; then
+    log "${BLUE}[-] Attempting to set MySQL root password (assuming default blank password)...${NC}"
+    mysqladmin -u root password "$MYSQL_ROOT_PASSWORD" >> $LOG_FILE 2>&1
+
+    if [ $? -eq 0 ]; then
+        log "${GREEN}[+] MySQL root password set successfully.${NC}"
+        MYSQL_ROOT_PW_SET_SUCCESS=1 # Set flag indicating success
+    else
+        log "${RED}[!] FAILED to automatically set MySQL root password.${NC}"
+        log "${YELLOW}[!] This might be because it was already set, or another issue occurred.${NC}"
+        log "${YELLOW}[!] Manual intervention required to set/verify MySQL root password.${NC}"
+        MYSQL_ROOT_PW_SET_SUCCESS=0
+    fi
+
+    # Run MySQL secure installation commands manually if mysql client exists AND password was set
+    if [ -f "/usr/bin/mysql" ]; then
+      if [ "$MYSQL_ROOT_PW_SET_SUCCESS" -eq 1 ]; then
+         log "${BLUE}[-] Running MySQL security commands (removing anonymous users, remote root)...${NC}"
+        # Commands to secure MySQL - use the generated password
+        mysql -u root --password="$MYSQL_ROOT_PASSWORD" << EOF
+DELETE FROM mysql.user WHERE User='';
+FLUSH PRIVILEGES;
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+FLUSH PRIVILEGES;
+-- Optionally remove test database
+-- DROP DATABASE IF EXISTS test;
+-- DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+-- FLUSH PRIVILEGES;
+EOF
+        if [ $? -eq 0 ]; then
+            log "${GREEN}[+] MySQL security commands executed successfully.${NC}"
+        else
+            log "${RED}[!] Failed to execute MySQL security commands. Check log and credentials.${NC}"
+        fi
+      else
+        log "${YELLOW}[!] Skipping MySQL security commands because root password was not set automatically.${NC}"
+      fi
+    else
+      log "${YELLOW}[!] MySQL client not found, cannot run security commands.${NC}"
+    fi
+     # Restart MySQL service after changes (only if password was likely set)
+    if [ "$MYSQL_ROOT_PW_SET_SUCCESS" -eq 1 ]; then
+        log "${BLUE}[-] Restarting MySQL service...${NC}"
+        service mysql restart >> $LOG_FILE 2>&1
+    fi
+  else
+    log "${RED}[!] MySQL service is not running after start attempt. Skipping MySQL hardening.${NC}"
+  fi
+else
+  log "${GREEN}[+] MySQL not found, skipping MySQL hardening.${NC}"
+fi
+
+# PostgreSQL hardening (No changes needed based on previous output)
+if command -v psql &> /dev/null; then
+  log "${BLUE}[-] Securing PostgreSQL...${NC}"
+
+  # Generate a strong postgres password
+  PG_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
+  save_credential "PostgreSQL 'postgres' user password (generated): $PG_PASSWORD"
+
+  # Find PostgreSQL main config directory (might vary slightly)
+  PG_CONF_DIR=$(find /etc/postgresql/ -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+
+  if [ -n "$PG_CONF_DIR" ] && [ -d "$PG_CONF_DIR/main" ]; then
+    PG_HBA_CONF="$PG_CONF_DIR/main/pg_hba.conf"
+    PG_CONF="$PG_CONF_DIR/main/postgresql.conf"
+    log "${BLUE}[-] Found PostgreSQL config directory: $PG_CONF_DIR/main${NC}"
+
+    if [ -f "$PG_HBA_CONF" ]; then
+      # Backup configs
+      cp "$PG_HBA_CONF" "$PG_HBA_CONF.bak.$(date +%F-%T)"
+      cp "$PG_CONF" "$PG_CONF.bak.$(date +%F-%T)"
+
+      # Attempt to update postgres password using ALTER USER
+      log "${BLUE}[-] Attempting to set PostgreSQL 'postgres' user password...${NC}"
+      if su - postgres -c "psql -c \"ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';\"" >> $LOG_FILE 2>&1; then
+        log "${GREEN}[+] PostgreSQL 'postgres' user password updated successfully.${NC}"
+        log "${YELLOW}[!] Recommended: Review $PG_HBA_CONF and change 'trust' to 'md5' for enhanced security.${NC}"
+      else
+        log "${RED}[!] Failed to set PostgreSQL 'postgres' user password. Service might not be running or user setup is different.${NC}"
+      fi
+
+      # Restart PostgreSQL for changes to take effect
+      log "${BLUE}[-] Restarting PostgreSQL service...${NC}"
+      service postgresql restart >> $LOG_FILE 2>&1 || service postgresql-8.3 restart >> $LOG_FILE 2>&1 # Try versioned service name
+    else
+      log "${RED}[!] PostgreSQL config file $PG_HBA_CONF not found.${NC}"
+    fi
+  else
+    log "${RED}[!] PostgreSQL config directory not found or structured differently.${NC}"
+  fi
+else
+  log "${GREEN}[+] PostgreSQL not found, skipping PostgreSQL hardening.${NC}"
+fi
+
+
+# --- Part 5: Secure User Accounts & Access ---
+# (No changes needed based on previous output, checks seemed sufficient)
+log "${YELLOW}[*] Step 5/9: Securing User Accounts & Access (SSH, FTP, Telnet)...${NC}"
+
+# Create the Project Group User
+log "${BLUE}[-] Creating project group user '$GROUP_USER'...${NC}"
+if id "$GROUP_USER" &>/dev/null; then
+  log "${YELLOW}[!] User '$GROUP_USER' already exists. Setting password.${NC}"
+else
+  useradd -m -s /bin/bash "$GROUP_USER"
+  if [ $? -ne 0 ]; then
+    log "${RED}[!] Failed to create user '$GROUP_USER'. Aborting user setup.${NC}"
+    # Continue script, but log the failure prominently
+  else
+    log "${GREEN}[+] User '$GROUP_USER' created successfully.${NC}"
+  fi
+fi
+echo "$GROUP_USER:$GROUP_PASS" | chpasswd
+log "${GREEN}[+] Set password for user '$GROUP_USER'.${NC}"
+
+# Ensure FTP access for the user
+log "${BLUE}[-] Ensuring FTP access for '$GROUP_USER'...${NC}"
+if [ -f "$VSFTPD_CONF" ]; then
+    # Ensure local users are enabled in vsftpd
+    if ! grep -q "^local_enable=YES" "$VSFTPD_CONF"; then
+        log "${YELLOW}[!] 'local_enable=YES' not found in $VSFTPD_CONF. Adding it.${NC}"
+        echo "local_enable=YES" >> "$VSFTPD_CONF"
+        # Also consider anonymous_enable=NO
+        sed -i 's/^anonymous_enable=.*/anonymous_enable=NO/' "$VSFTPD_CONF"
+        log "${BLUE}[-] Restarting vsftpd service...${NC}"
+        service vsftpd restart >> $LOG_FILE 2>&1
+    fi
+    # Remove user from ftpusers if present
+    if [ -f "/etc/ftpusers" ]; then
+        sed -i "/^${GROUP_USER}$/d" /etc/ftpusers
+        log "${GREEN}[+] Ensured '$GROUP_USER' is not blocked by /etc/ftpusers.${NC}"
+    fi
+else
+    log "${YELLOW}[!] $VSFTPD_CONF not found. Assuming FTP server handles user access correctly or is not vsftpd.${NC}"
+fi
+
+# Ensure Telnet access for the user
+log "${BLUE}[-] Ensuring Telnet service is enabled (via inetd)...${NC}"
+if [ -f "$INETD_CONF" ]; then
+    # Check if telnet line exists and is commented out
+    if grep -q "^#\s*telnet" "$INETD_CONF"; then
+        log "${YELLOW}[!] Telnet service is commented out in $INETD_CONF. Enabling...${NC}"
+        sed -i '/^#\s*telnet/s/^#\s*//' "$INETD_CONF"
+        # Ensure inetd re-reads config
+        pkill -HUP inetd >> $LOG_FILE 2>&1
+        log "${GREEN}[+] Telnet service enabled in $INETD_CONF.${NC}"
+    elif grep -q "^\s*telnet" "$INETD_CONF"; then
+        log "${GREEN}[+] Telnet service appears to be enabled in $INETD_CONF.${NC}"
+    else
+        log "${YELLOW}[!] Could not find a telnet service line in $INETD_CONF. Manual check required.${NC}"
+    fi
+else
+    log "${YELLOW}[!] $INETD_CONF not found. Cannot verify Telnet status automatically.${NC}"
+fi
+
+
+# Secure SSH Configuration and Backup Admin
+if [ -f "/etc/ssh/sshd_config" ]; then
+  log "${BLUE}[-] Hardening SSH configuration (/etc/ssh/sshd_config)...${NC}"
+  cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%F-%T)
+
+  # Apply SSH hardening rules
+  sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+  sed -i 's/^#*Protocol.*/Protocol 2/' /etc/ssh/sshd_config
+  # Add/Ensure Protocol 2 if not present
+  if ! grep -q "^Protocol" /etc/ssh/sshd_config; then
+      echo "Protocol 2" >> /etc/ssh/sshd_config
+  fi
+  log "${GREEN}[+] Applied basic SSH hardening rules.${NC}"
+
+  # Secure existing msfadmin user (change password)
+  if id "msfadmin" &>/dev/null; then
+    log "${BLUE}[-] Changing password for default 'msfadmin' account...${NC}"
+    MSFADMIN_PASSWORD="M3t@spl01t_H@rd3n3d!" # Make it different and slightly more complex
+    echo "msfadmin:$MSFADMIN_PASSWORD" | chpasswd
+    save_credential "Default 'msfadmin' password changed to: $MSFADMIN_PASSWORD"
+    log "${GREEN}[+] Default 'msfadmin' password updated.${NC}"
+  fi
+
+  # Create backup admin account 'secadmin'
+  log "${BLUE}[-] Creating backup administrator account 'secadmin'...${NC}"
+  ADMIN_PASSWORD=$(openssl rand -base64 10 | tr -dc 'a-zA-Z0-9')
+  if id "secadmin" &>/dev/null; then
+      log "${YELLOW}[!] Backup admin 'secadmin' already exists. Setting password.${NC}"
+  else
+      useradd -m -s /bin/bash secadmin
+      log "${GREEN}[+] Backup admin user 'secadmin' created.${NC}"
+  fi
+  echo "secadmin:$ADMIN_PASSWORD" | chpasswd
+  log "${GREEN}[+] Set password for 'secadmin'.${NC}"
+
+  # Add 'secadmin' to sudoers if sudo is installed
+  if [ -f "/etc/sudoers" ] && command -v sudo &>/dev/null; then
+    if ! grep -q "^secadmin ALL=(ALL) ALL" /etc/sudoers; then
+        cp /etc/sudoers /etc/sudoers.bak.$(date +%F-%T)
+        echo "secadmin ALL=(ALL) ALL" >> /etc/sudoers
+        log "${GREEN}[+] Added 'secadmin' to sudoers.${NC}"
+    else
+        log "${YELLOW}[!] 'secadmin' already exists in sudoers.${NC}"
+    fi
+  fi
+
+  # Save credentials
+  save_credential "Backup Admin user: secadmin"
+  save_credential "Backup Admin password: $ADMIN_PASSWORD"
+
+  # Restart SSH service
+  log "${BLUE}[-] Restarting SSH service...${NC}"
+  service ssh restart >> $LOG_FILE 2>&1
+  log "${GREEN}[+] SSH service configuration secured and restarted.${NC}"
+else
+  log "${RED}[!] SSH config file /etc/ssh/sshd_config not found! Cannot secure SSH.${NC}"
+fi
+
+# --- Part 6: Secure Local Firewall Configuration (iptables on MS2) ---
+# (No changes needed based on previous output)
+log "${YELLOW}[*] Step 6/9: Setting up LOCAL firewall rules (iptables on MS2)...${NC}"
+log "${BLUE}[-] This provides defense-in-depth. The MAIN firewall is your separate server.${NC}"
+log "${BLUE}[-] Your separate firewall manages external access and the 10 forwarded ports.${NC}"
+
+# Ports required by the project FOR METASPLOITABLE 2
+KEEP_OPEN_LOCALLY=(
+    21   # FTP (Project Mandatory)
+    22   # SSH (Project Mandatory)
+    23   # Telnet (Project Mandatory)
+    80   # HTTP (Project Mandatory)
+    # Common MS2 services (Keep accessible for internal testing/functionality)
+    139  # NetBIOS Session Service (Samba)
+    445  # Microsoft DS (Samba)
+    1524 # Ingreslock / Bindshell port (Service needed, shell removed)
+    3306 # MySQL
+    5432 # PostgreSQL
+    5900 # VNC (Often enabled on MS2)
+    8009 # Apache Tomcat AJP Connector
+    8180 # Apache Tomcat HTTP
+)
+
+# Ports to explicitly BLOCK LOCALLY on MS2 (Backdoors, high risk)
+BLOCK_LOCALLY=(
+    6000 # X11 - Usually not needed remotely
+    6200 # vsftpd backdoor port
+    6667 # UnrealIRCd default port (often backdoor target)
+)
+
+log "${BLUE}[-] Setting up LOCAL iptables rules on MS2...${NC}"
+
+# Flush existing rules
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t mangle -X
+
+# Set default policies: ACCEPT traffic by default, then explicitly DROP bad ports.
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT # MS2 should likely not be forwarding
+iptables -P OUTPUT ACCEPT
+
+# Allow loopback traffic (essential)
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow established connections
+iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# Explicitly ACCEPT required project ports (redundant with default ACCEPT, but good practice)
+log "${BLUE}[-] Ensuring required project ports (${KEEP_OPEN_LOCALLY[*]}) are accessible locally...${NC}"
+for port in "${KEEP_OPEN_LOCALLY[@]}"; do
+   iptables -A INPUT -p tcp --dport $port -m state --state NEW -j ACCEPT
+done
+
+# Explicitly DROP known bad/backdoor/unnecessary ports LOCALLY
+log "${BLUE}[-] Blocking known high-risk/backdoor ports (${BLOCK_LOCALLY[*]}) locally...${NC}"
+for port in "${BLOCK_LOCALLY[@]}"; do
+  iptables -A INPUT -p tcp --dport $port -j DROP
+  iptables -A INPUT -p udp --dport $port -j DROP # Block UDP too
+  log "${GREEN}[+] Blocked port $port locally on MS2.${NC}"
+done
+
+# Add rate limiting for SSH (prevents simple brute force)
+log "${BLUE}[-] Adding rate limiting for SSH (port 22) locally...${NC}"
+iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --set --name SSH
+iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
+log "${GREEN}[+] Added rate limiting for SSH locally.${NC}"
+
+log "${GREEN}[+] Local firewall configured on MS2: Required ports open, high-risk ports blocked.${NC}"
+log "${YELLOW}[!] Reminder: Configure your DEDICATED firewall server for primary network protection.${NC}"
+
+# Create a script to restore these LOCAL rules at boot
+log "${BLUE}[-] Creating script to restore local iptables rules at boot...${NC}"
+cat > /etc/network/if-up.d/firewall-rules-local << EOL
+#!/bin/sh
+# Local Firewall rules for Metasploitable 2 (Project 3 - Defense in Depth)
+# These are secondary to the main dedicated firewall server.
+
+echo "Applying local Metasploitable 2 firewall rules..." | logger
+
+# Flush existing rules silently
+/sbin/iptables -F > /dev/null 2>&1
+/sbin/iptables -X > /dev/null 2>&1
+/sbin/iptables -t nat -F > /dev/null 2>&1
+/sbin/iptables -t nat -X > /dev/null 2>&1
+/sbin/iptables -t mangle -F > /dev/null 2>&1
+/sbin/iptables -t mangle -X > /dev/null 2>&1
+
+# Set default policies (ACCEPT locally, DROP specifics)
+/sbin/iptables -P INPUT ACCEPT
+/sbin/iptables -P FORWARD ACCEPT
+/sbin/iptables -P OUTPUT ACCEPT
+
+# Allow loopback & established
+/sbin/iptables -A INPUT -i lo -j ACCEPT
+/sbin/iptables -A OUTPUT -o lo -j ACCEPT
+/sbin/iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# Explicitly ACCEPT required project ports locally
+PORTS_TO_ACCEPT=(${KEEP_OPEN_LOCALLY[@]})
+for port in "\${PORTS_TO_ACCEPT[@]}"; do
+   /sbin/iptables -A INPUT -p tcp --dport \$port -m state --state NEW -j ACCEPT
+done
+
+# Explicitly DROP known bad ports locally
+PORTS_TO_DROP=(${BLOCK_LOCALLY[@]})
+for port in "\${PORTS_TO_DROP[@]}"; do
+  /sbin/iptables -A INPUT -p tcp --dport \$port -j DROP
+  /sbin/iptables -A INPUT -p udp --dport \$port -j DROP
+done
+
+# SSH Rate Limiting
+/sbin/iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --set --name SSH
+/sbin/iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
+
+echo "Local Metasploitable 2 firewall rules applied." | logger
+
+exit 0
+EOL
+
+chmod +x /etc/network/if-up.d/firewall-rules-local
+log "${GREEN}[+] Created local firewall boot script at /etc/network/if-up.d/firewall-rules-local${NC}"
+# Attempt to install iptables-persistent if apt worked
+if apt-get install -y iptables-persistent >> $LOG_FILE 2>&1; then
+    log "${GREEN}[+] Installed iptables-persistent. Saving current rules...${NC}"
+    iptables-save > /etc/iptables/rules.v4
+    ip6tables-save > /etc/iptables/rules.v6
+    log "${GREEN}[+] Saved rules using iptables-persistent.${NC}"
+    # Can potentially remove the if-up.d script if persistent works reliably
+    # rm /etc/network/if-up.d/firewall-rules-local
+else
+    log "${YELLOW}[!] Could not install iptables-persistent. Relying on if-up.d script.${NC}"
+fi
+
+
+# --- Part 7: Basic Web Application Security ---
+log "${YELLOW}[*] Step 7/9: Basic web application security (Apache, DVWA)...${NC}"
+
+# Basic Apache security headers with config test
+if [ -d "/etc/apache2" ]; then
+  log "${BLUE}[-] Applying basic Apache security measures...${NC}"
+
+  APACHE_CONF="/etc/apache2/apache2.conf"
+  SECURITY_CONF="/etc/apache2/conf-available/security.conf" # Preferred location on newer systems, check if exists
+
+  TARGET_CONF=""
+  if [ -f "$SECURITY_CONF" ]; then
+      TARGET_CONF="$SECURITY_CONF"
+      log "[INFO] Using $TARGET_CONF for Apache security settings."
+  elif [ -f "$APACHE_CONF" ]; then
+      TARGET_CONF="$APACHE_CONF"
+      log "[INFO] Using $APACHE_CONF for Apache security settings."
+  fi
+
+  if [ -n "$TARGET_CONF" ]; then
+    cp "$TARGET_CONF" "$TARGET_CONF.bak.$(date +%F-%T)"
+
+    # Ensure basic security settings are present and correct
+    if grep -q "^ServerTokens" "$TARGET_CONF"; then sed -i 's/^ServerTokens.*/ServerTokens Prod/' "$TARGET_CONF"; else echo "ServerTokens Prod" >> "$TARGET_CONF"; fi
+    if grep -q "^ServerSignature" "$TARGET_CONF"; then sed -i 's/^ServerSignature.*/ServerSignature Off/' "$TARGET_CONF"; else echo "ServerSignature Off" >> "$TARGET_CONF"; fi
+    if grep -q "^TraceEnable" "$TARGET_CONF"; then sed -i 's/^TraceEnable.*/TraceEnable Off/' "$TARGET_CONF"; else echo "TraceEnable Off" >> "$TARGET_CONF"; fi
+    log "${GREEN}[+] Applied basic Apache security directives (ServerTokens, ServerSignature, TraceEnable).${NC}"
+
+    # Ensure security conf is enabled if it exists
+    if [ -f "$SECURITY_CONF" ] && [ -d "/etc/apache2/conf-enabled" ] && [ ! -L "/etc/apache2/conf-enabled/security.conf" ]; then
+        ln -s ../conf-available/security.conf /etc/apache2/conf-enabled/security.conf 2>> $LOG_FILE
+        log "[INFO] Enabled Apache security.conf."
+    fi
+
+    # Test configuration before restarting
+    log "${BLUE}[-] Testing Apache configuration...${NC}"
+    APACHE_CONFIG_TEST_OUTPUT=$(apache2ctl configtest 2>&1)
+    APACHE_CONFIG_TEST_STATUS=$?
+
+    if [ $APACHE_CONFIG_TEST_STATUS -eq 0 ]; then
+        log "${GREEN}[+] Apache config test successful.${NC}"
+        # Restart Apache
+        log "${BLUE}[-] Restarting Apache service...${NC}"
+        service apache2 restart >> $LOG_FILE 2>&1
+        if [ $? -eq 0 ]; then
+            log "${GREEN}[+] Apache restarted successfully.${NC}"
+        else
+            log "${RED}[!] Apache restart failed even after successful config test. Check service status and logs.${NC}"
+        fi
+    else
+        log "${RED}[!] Apache config test failed! Apache NOT restarted.${NC}"
+        log "${RED}[!] Config test output: ${APACHE_CONFIG_TEST_OUTPUT}${NC}"
+        log "${YELLOW}[!] Manual intervention required. Check Apache configuration files (especially $TARGET_CONF).${NC}"
+        log "${YELLOW}[!] Backup config available at $TARGET_CONF.bak.*${NC}"
+    fi
+  else
+    log "${RED}[!] Apache config file ($APACHE_CONF or $SECURITY_CONF) not found. Skipping Apache hardening.${NC}"
+  fi
+else
+    log "${GREEN}[+] Apache2 directory not found, skipping Apache hardening.${NC}"
+fi
+
+# Secure DVWA database password if possible
+DVWA_CONFIG="/var/www/dvwa/config/config.inc.php"
+if [ -f "$DVWA_CONFIG" ]; then
+  log "${BLUE}[-] Securing DVWA configuration...${NC}"
+  cp $DVWA_CONFIG $DVWA_CONFIG.bak.$(date +%F-%T)
+
+  # Generate new DVWA database password
+  DVWA_DB_PASS=$(openssl rand -base64 8 | tr -dc 'a-zA-Z0-9')
+  log "${BLUE}[-] Generated new DVWA DB password.${NC}"
+
+  # Update config file
+  sed -i "s/^\$_DVWA\[ 'db_password' \]\s*=\s*'.*';/\$_DVWA[ 'db_password' ] = '$DVWA_DB_PASS';/" $DVWA_CONFIG
+  log "${GREEN}[+] Updated DVWA password in $DVWA_CONFIG.${NC}"
+  save_credential "DVWA database password (generated): $DVWA_DB_PASS" # Save cred regardless
+
+  # Update the database user password only if MySQL is running AND root password was set
+  if command -v mysql &> /dev/null && service mysql status &> /dev/null; then
+      if [ "$MYSQL_ROOT_PW_SET_SUCCESS" -eq 1 ]; then
+          log "${BLUE}[-] Attempting to update DVWA database user password in MySQL...${NC}"
+          mysql -u root --password="$MYSQL_ROOT_PASSWORD" -e "SET PASSWORD FOR 'dvwa'@'localhost' = PASSWORD('$DVWA_DB_PASS'); FLUSH PRIVILEGES;" >> $LOG_FILE 2>&1
+          MYSQL_DVWA_UPDATE_STATUS=$?
+          mysql -u root --password="$MYSQL_ROOT_PASSWORD" -e "SET PASSWORD FOR 'dvwa'@'127.0.0.1' = PASSWORD('$DVWA_DB_PASS'); FLUSH PRIVILEGES;" >> $LOG_FILE 2>&1
+          # Check status of the first command primarily
+          if [ $MYSQL_DVWA_UPDATE_STATUS -eq 0 ]; then
+              log "${GREEN}[+] Successfully updated DVWA database user password in MySQL.${NC}"
+          else
+              log "${RED}[!] Failed to update DVWA database user password in MySQL using root account. Check logs.${NC}"
+          fi
+      else
+          log "${RED}[!] Cannot automatically update DVWA password in MySQL because MySQL root password was not set successfully by this script.${NC}"
+          log "${YELLOW}[!] Manual Action Required: Ensure MySQL is running, set MySQL root password to '$MYSQL_ROOT_PASSWORD' (from credentials file), then run:${NC}"
+          log "${YELLOW}[!]   sudo mysql -u root -p'$MYSQL_ROOT_PASSWORD' -e \"SET PASSWORD FOR 'dvwa'@'localhost' = PASSWORD('$DVWA_DB_PASS'); FLUSH PRIVILEGES;\"${NC}"
+      fi
+  else
+    log "${RED}[!] Cannot automatically update DVWA password in MySQL because MySQL service is not running or unavailable.${NC}"
+    log "${YELLOW}[!] Manual Action Required: Start MySQL, set MySQL root password to '$MYSQL_ROOT_PASSWORD' (from credentials file), then run the command above.${NC}"
+  fi
+  log "${GREEN}[+] Secured DVWA configuration (config file updated). Check MySQL status/logs for DB update result.${NC}"
+else
+    log "${GREEN}[+] DVWA config not found at $DVWA_CONFIG, skipping DVWA hardening.${NC}"
+fi
+
+# --- Part 8: Additional Security Measures ---
+# (No changes needed based on previous output)
+log "${YELLOW}[*] Step 8/9: Additional security measures...${NC}"
+
+# Secure cron jobs permissions
+log "${BLUE}[-] Securing cron configuration permissions...${NC}"
+chmod -R 700 /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly >> $LOG_FILE 2>&1
+chown root:root /etc/crontab >> $LOG_FILE 2>&1
+chmod 600 /etc/crontab >> $LOG_FILE 2>&1
+log "${GREEN}[+] Secured cron directories and file permissions.${NC}"
+
+# Set secure permissions on critical system files
+log "${BLUE}[-] Setting secure permissions on critical files (/etc/shadow, /etc/passwd)...${NC}"
+chmod 640 /etc/shadow 2>/dev/null
+chown root:shadow /etc/shadow 2>/dev/null # Ensure correct group ownership
+chmod 644 /etc/passwd 2>/dev/null
+chown root:root /etc/passwd 2>/dev/null
+log "${GREEN}[+] Set secure permissions on /etc/shadow and /etc/passwd.${NC}"
+
+# Create a simple security monitoring script
+log "${BLUE}[-] Creating basic security monitoring script (/usr/local/bin/security-monitor.sh)...${NC}"
+cat > /usr/local/bin/security-monitor.sh << 'EOL'
+#!/bin/bash
+# Simple security monitoring script for Metasploitable 2
+
+LOG_FILE="/var/log/security_monitor.log"
+echo "=== Security check run at $(date) ===" > $LOG_FILE
+echo "--- System Info ---" >> $LOG_FILE
+uname -a >> $LOG_FILE
+echo "" >> $LOG_FILE
+
+echo "--- Listening TCP/UDP Ports ---" >> $LOG_FILE
+netstat -tulnp >> $LOG_FILE
+echo "" >> $LOG_FILE
+
+echo "--- Users with UID 0 ---" >> $LOG_FILE
+awk -F: '($3 == "0") {print}' /etc/passwd >> $LOG_FILE
+echo "" >> $LOG_FILE
+
+echo "--- Sudoers Configuration (Non-default entries) ---" >> $LOG_FILE
+grep -vE "^#|^Defaults|^$" /etc/sudoers /etc/sudoers.d/* 2>/dev/null >> $LOG_FILE
+echo "" >> $LOG_FILE
+
+echo "--- Last 10 Logins ---" >> $LOG_FILE
+last -n 10 >> $LOG_FILE
+echo "" >> $LOG_FILE
+
+echo "--- Recent Failed Logins (auth.log) ---" >> $LOG_FILE
+grep -i "Failed password" /var/log/auth.log | tail -n 20 >> $LOG_FILE
+echo "" >> $LOG_FILE
+
+echo "--- World-Writable Files in /etc ---" >> $LOG_FILE
+find /etc -type f -perm -002 -ls >> $LOG_FILE 2>/dev/null
+echo "" >> $LOG_FILE
+
+echo "--- Processes running as root ---" >> $LOG_FILE
+ps -U root -u root u | head -n 20 >> $LOG_FILE # Limit output
+echo "" >> $LOG_FILE
+
+echo "=== Security check finished at $(date) ===" >> $LOG_FILE
+
+exit 0
+EOL
+
+chmod +x /usr/local/bin/security-monitor.sh
+
+# Add to cron to run daily
+echo "0 3 * * * root /usr/local/bin/security-monitor.sh" > /etc/cron.d/security-check
+chmod 644 /etc/cron.d/security-check
+
+log "${GREEN}[+] Created daily security check script and cron job.${NC}"
+
+# Create login banner (/etc/issue, /etc/issue.net)
+log "${BLUE}[-] Creating login banner...${NC}"
+cat > /etc/issue << 'EOL'
+************************************************************
+* Metasploitable 2 - Project 3 Instance           *
+* AUTHORIZED ACCESS ONLY                   *
+* *
+* All activities on this system are logged and monitored.  *
+* Unauthorized access or use is strictly prohibited and    *
+* may be subject to disciplinary action or legal prosecution.*
+************************************************************
+Ubuntu 8.04 LTS
+EOL
+
+cp /etc/issue /etc/issue.net
+log "${GREEN}[+] Created login banners (/etc/issue, /etc/issue.net).${NC}"
+
+# --- Part 9: Final Steps & Summary ---
+log "${YELLOW}[*] Step 9/9: Finalizing and summarizing...${NC}"
+
+log "${GREEN}=====================================================================${NC}"
+log "${GREEN}        METASPLOITABLE 2 ENHANCED HARDENING COMPLETED (Project 3 v3)   ${NC}"
+log "${GREEN}=====================================================================${NC}"
+log "${YELLOW}[!] Key security improvements implemented on THIS Metasploitable 2 VM:${NC}"
+log "${YELLOW}[!] - Updated package sources, installed local tools (iptables, tcpd).${NC}"
+log "${YELLOW}[!] - Checked/disabled known backdoors (ingreslock shell, vsftpd vuln check, UnrealIRCd).${NC}"
+log "${YELLOW}[!] - Blocked high-risk/backdoor ports LOCALLY via iptables (${BLOCK_LOCALLY[*]}).${NC}"
+log "${YELLOW}[!] - Ensured required project ports remain accessible LOCALLY (${KEEP_OPEN_LOCALLY[*]}).${NC}"
+log "${YELLOW}[!] - Attempted to secure DBs (PostgreSQL PW set; MySQL PW attempted - check status).${NC}"
+log "${YELLOW}[!] - Hardened SSH (Root login disabled, Protocol 2 enforced, rate limiting).${NC}"
+log "${YELLOW}[!] - Created PROJECT group user '$GROUP_USER' with specified password for FTP/SSH/Telnet access.${NC}"
+log "${YELLOW}[!] - Created backup 'secadmin' administrator account.${NC}"
+log "${YELLOW}[!] - Changed default 'msfadmin' password.${NC}"
+log "${YELLOW}[!] - Applied basic Apache security headers (Restart conditional on config test).${NC}"
+log "${YELLOW}[!] - Secured DVWA config; DB password update attempted (Check MySQL status).${NC}"
+log "${YELLOW}[!] - Added daily security monitoring script & cron job.${NC}"
+log "${YELLOW}[!] - Set secure permissions on critical files & cron.${NC}"
+log "${YELLOW}[!] - Added login banners.${NC}"
+log "${GREEN}=====================================================================${NC}"
+log "${YELLOW}[!] Secure credentials generated by this script are saved at: $CREDENTIALS_FILE${NC}"
+log "${YELLOW}[!] PROTECT THIS FILE - IT CONTAINS PASSWORDS!${NC}"
+log "${GREEN}=====================================================================${NC}"
+
+echo ""
+echo -e "${GREEN}===========================================================${NC}"
+echo -e "${GREEN}    Metasploitable 2 Hardening Completed (Project 3 v3)    ${NC}"
+echo -e "${GREEN}===========================================================${NC}"
+echo -e "${YELLOW}IMPORTANT PROJECT 3 NOTES:${NC}"
+echo -e "${YELLOW}1.  Credentials saved in: ${BLUE}$CREDENTIALS_FILE${NC} ${RED}SECURE THIS FILE!${NC}"
+echo -e "${YELLOW}2.  Project access user: ${BLUE}$GROUP_USER${NC} (FTP/SSH/Telnet)${NC}"
+echo -e "${YELLOW}3.  Backup admin user: '${BLUE}secadmin${NC}'${NC}"
+echo -e "${YELLOW}4.  Local iptables rules applied; main protection is your dedicated firewall.${NC}"
+echo -e "${YELLOW}5.  ${RED}Check script log ($LOG_FILE) for specific outcomes:${NC}"
+echo -e "${YELLOW}    - MySQL start/password setting status (Manual check/action may be needed).${NC}"
+echo -e "${YELLOW}    - Apache restart status (Manual config check/restart may be needed).${NC}"
+echo -e "${YELLOW}    - DVWA DB password update status (Manual update may be needed).${NC}"
+echo -e "${YELLOW}6.  Remember the 10 port forwarding limit & hardware constraints.${NC}"
+echo -e "${YELLOW}7.  Daily security check logs to /var/log/security_monitor.log${NC}"
+echo -e "${GREEN}===========================================================${NC}"
+
+# End of script
+exit 0
